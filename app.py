@@ -19,9 +19,19 @@ CORS(app, resources={
     r"/*": {
         "origins": "*",
         "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type"]
+        "allow_headers": ["Content-Type"],
+        "expose_headers": ["Content-Type"],
+        "supports_credentials": False
     }
 })
+
+# Add CORS headers to all responses
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+    response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    return response
 
 # Load the trained model
 print("🔄 Loading trained YOLO model...")
@@ -64,21 +74,53 @@ def download_model():
 print("="*50)
 print("MODEL LOADING")
 print("="*50)
-try:
-    if download_model() and os.path.exists(MODEL_PATH):
-        print(f"Loading model from: {MODEL_PATH}")
-        # Load without fusing to avoid timeout
-        model = YOLO(MODEL_PATH, task='detect')
-        model.fuse = lambda *args, **kwargs: model  # Disable fusion
-        print(f"✅ Custom model loaded: {MODEL_PATH}")
-        print(f"Model size: {os.path.getsize(MODEL_PATH) / 1024 / 1024:.2f} MB")
-    else:
-        raise FileNotFoundError("Model not available")
-except Exception as e:
-    print(f"⚠️  Using pretrained model as fallback: {e}")
-    model = YOLO('yolov8n.pt')
-    print("✅ Pretrained YOLOv8n loaded")
-print("="*50)
+
+# Global model variable
+model = None
+
+def load_model():
+    """Load model once and cache it - optimized for 512MB RAM"""
+    global model
+    if model is not None:
+        return model
+    
+    try:
+        if download_model() and os.path.exists(MODEL_PATH):
+            print(f"Loading model from: {MODEL_PATH}")
+            # Load with MINIMAL memory footprint
+            import torch
+            import gc
+            
+            # Force garbage collection
+            gc.collect()
+            
+            # Load model with minimal overhead
+            model = YOLO(MODEL_PATH, task='detect')
+            
+            # Optimize for low memory
+            if hasattr(model, 'model'):
+                model.model.eval()
+                # Disable gradients to save memory
+                for param in model.model.parameters():
+                    param.requires_grad = False
+            
+            # Clean up
+            gc.collect()
+            
+            print(f"✅ Custom model loaded: {MODEL_PATH}")
+            print(f"Model size: {os.path.getsize(MODEL_PATH) / 1024 / 1024:.2f} MB")
+        else:
+            raise FileNotFoundError("Model not available")
+    except Exception as e:
+        print(f"⚠️  Using pretrained model as fallback: {e}")
+        model = YOLO('yolov8n.pt')
+        print("✅ Pretrained YOLOv8n loaded")
+    
+    print("="*50)
+    return model
+
+# Load model at startup
+model = load_model()
 
 # Class names
 CLASS_NAMES = [
@@ -107,11 +149,16 @@ def health():
     model_exists = os.path.exists(MODEL_PATH)
     return jsonify({
         'status': 'ok',
-        'model_loaded': True,
+        'model_loaded': model is not None,
         'model_path': MODEL_PATH,
         'custom_model': model_exists,
         'model_size_mb': round(os.path.getsize(MODEL_PATH) / 1024 / 1024, 2) if model_exists else 0
     })
+
+@app.route('/ping', methods=['GET'])
+def ping():
+    """Simple ping endpoint for keep-alive"""
+    return jsonify({'status': 'alive', 'timestamp': __import__('time').time()})
 
 @app.route('/detect', methods=['POST'])
 def detect():
@@ -142,8 +189,30 @@ def detect():
         if img is None:
             return jsonify({'error': 'Invalid image'}), 400
 
-        # Run inference with optimized settings
-        results = model(img, conf=0.25, iou=0.45, verbose=False, device='cpu')
+        # Resize to small size for 512MB RAM limit
+        max_size = 640
+        h, w = img.shape[:2]
+        if max(h, w) > max_size:
+            scale = max_size / max(h, w)
+            new_w, new_h = int(w * scale), int(h * scale)
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        # Run inference with LOW MEMORY settings
+        import gc
+        gc.collect()  # Clean memory before inference
+        
+        results = model(
+            img, 
+            conf=0.3,       # Higher confidence = less detections = less memory
+            iou=0.5, 
+            verbose=False, 
+            device='cpu',
+            half=False,
+            imgsz=320,      # SMALL size for low RAM
+            max_det=50      # Limit detections
+        )
+        
+        gc.collect()  # Clean memory after inference
         
         # Parse results and draw annotations
         detections = []
@@ -201,7 +270,19 @@ def detect():
         })
         
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        print(f"❌ Detection error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+# Global error handler
+@app.errorhandler(Exception)
+def handle_error(error):
+    return jsonify({
+        'success': False,
+        'error': str(error)
+    }), 500
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
