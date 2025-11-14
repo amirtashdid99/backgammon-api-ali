@@ -10,40 +10,68 @@ import cv2
 import numpy as np
 import base64
 import os
+import sys
 
 app = Flask(__name__)
-CORS(app)  # Allow requests from Vercel frontend
+
+# Configure CORS for production
+CORS(app, resources={
+    r"/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type"]
+    }
+})
 
 # Load the trained model
 print("🔄 Loading trained YOLO model...")
+print(f"Python version: {sys.version}")
+print(f"Working directory: {os.getcwd()}")
 
-# Download model from Google Drive if not exists
+# Model configuration
 MODEL_PATH = 'best.pt'
-MODEL_URL = 'https://drive.google.com/uc?export=download&id=1Ov3gwbRkD3Nd9cdfn1WLvDljPGfaAXrh'
+GOOGLE_DRIVE_ID = '1Ov3gwbRkD3Nd9cdfn1WLvDljPGfaAXrh'
 
 def download_model():
-    """Download model from Google Drive"""
-    if not os.path.exists(MODEL_PATH):
-        print(f"📥 Downloading model from Google Drive...")
+    """Download model from Google Drive using gdown"""
+    if os.path.exists(MODEL_PATH):
+        print(f"✅ Model already exists: {MODEL_PATH}")
+        return True
+    
+    print(f"📥 Downloading model from Google Drive...")
+    try:
+        import gdown
+        url = f'https://drive.google.com/uc?id={GOOGLE_DRIVE_ID}'
+        gdown.download(url, MODEL_PATH, quiet=False)
+        print(f"✅ Model downloaded: {MODEL_PATH}")
+        return True
+    except ImportError:
+        print("⚠️  gdown not installed, trying urllib...")
         try:
             import urllib.request
-            urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+            url = f'https://drive.google.com/uc?export=download&id={GOOGLE_DRIVE_ID}'
+            urllib.request.urlretrieve(url, MODEL_PATH)
             print(f"✅ Model downloaded: {MODEL_PATH}")
+            return True
         except Exception as e:
-            print(f"⚠️  Download failed: {e}")
+            print(f"❌ Download failed: {e}")
             return False
-    return True
+    except Exception as e:
+        print(f"❌ Download failed: {e}")
+        return False
 
 # Try to load custom trained model
 try:
     if download_model() and os.path.exists(MODEL_PATH):
         model = YOLO(MODEL_PATH)
         print(f"✅ Custom model loaded: {MODEL_PATH}")
+        print(f"Model size: {os.path.getsize(MODEL_PATH) / 1024 / 1024:.2f} MB")
     else:
         raise FileNotFoundError("Model not available")
 except Exception as e:
     print(f"⚠️  Using pretrained model as fallback: {e}")
     model = YOLO('yolov8n.pt')
+    print("✅ Pretrained YOLOv8n loaded")
 
 # Class names
 CLASS_NAMES = [
@@ -69,10 +97,13 @@ def index():
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
+    model_exists = os.path.exists(MODEL_PATH)
     return jsonify({
         'status': 'ok',
         'model_loaded': True,
-        'model_path': MODEL_PATH
+        'model_path': MODEL_PATH,
+        'custom_model': model_exists,
+        'model_size_mb': round(os.path.getsize(MODEL_PATH) / 1024 / 1024, 2) if model_exists else 0
     })
 
 @app.route('/detect', methods=['POST'])
@@ -104,8 +135,8 @@ def detect():
         if img is None:
             return jsonify({'error': 'Invalid image'}), 400
 
-        # Run inference
-        results = model(img, conf=0.25, iou=0.45)
+        # Run inference with optimized settings
+        results = model(img, conf=0.25, iou=0.45, verbose=False, device='cpu')
         
         # Parse results and draw annotations
         detections = []
