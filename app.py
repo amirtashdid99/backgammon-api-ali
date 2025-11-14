@@ -61,9 +61,15 @@ def download_model():
         return False
 
 # Try to load custom trained model
+print("="*50)
+print("MODEL LOADING")
+print("="*50)
 try:
     if download_model() and os.path.exists(MODEL_PATH):
-        model = YOLO(MODEL_PATH)
+        print(f"Loading model from: {MODEL_PATH}")
+        # Load without fusing to avoid timeout
+        model = YOLO(MODEL_PATH, task='detect')
+        model.fuse = lambda *args, **kwargs: model  # Disable fusion
         print(f"✅ Custom model loaded: {MODEL_PATH}")
         print(f"Model size: {os.path.getsize(MODEL_PATH) / 1024 / 1024:.2f} MB")
     else:
@@ -72,6 +78,7 @@ except Exception as e:
     print(f"⚠️  Using pretrained model as fallback: {e}")
     model = YOLO('yolov8n.pt')
     print("✅ Pretrained YOLOv8n loaded")
+print("="*50)
 
 # Class names
 CLASS_NAMES = [
